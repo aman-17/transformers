@@ -1,51 +1,35 @@
-# Copyright 2024 EleutherAI and The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import argparse
 import gc
 import json
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 import yaml
 from tokenizers import Tokenizer
+from huggingface_hub import HfApi
 
-from transformers import Olmo1124Config, Olmo1124ForCausalLM
+from transformers import Olmo1124Config
+from transformers import Olmo1124ForCausalLM
 from transformers.models.gpt2.tokenization_gpt2_fast import GPT2TokenizerFast
+
+import os
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 
 """
 Sample usage:
 
 ```
-python src/transformers/models/olmo_1124/convert_olmo_1124_weights_to_hf.py \
-    --input_dir /path/to/downloaded/olmo_1124/weights --model_size 7B --output_dir /output/path
+# make sure to donwload an olmo checkpoint with a `config.yaml` and `model.pt`
+
+exp_name=peteish7-anneal-from-928646-50B-nowup-moremath-dclm07-fw2
+python scripts/convert_olmo_1124_weights_to_hf.py \
+    --input_dir models/$exp_name  --output_dir "models/${exp_name}_hf"
+huggingface-cli upload --revision "${exp_name}_hf" allenai/open_instruct_dev "models/${exp_name}_hf" .
 ```
-
-Thereafter, models can be loaded via:
-
-```py
-from transformers import Olmo1124ForCausalLM, AutoTokenizer
-
-model = Olmo1124ForCausalLM.from_pretrained("/output/path")
-tokenizer = AutoTokenizer.from_pretrained("/output/path")
-```
-
-Important note: you need to be able to host the whole model in RAM to execute this script (even if the biggest versions
-come in several checkpoints they each contain a part of each weight of the model, so we need to load them all in RAM).
 """
 
 
@@ -63,6 +47,27 @@ def write_json(text, path):
         json.dump(text, f)
 
 
+def push_folder_to_hub(
+    output_dir: str,
+    hf_repo_id: Optional[str] = None,
+    hf_repo_revision: Optional[str] = None,
+    private: bool = True,
+):
+    hf_repo_url = f"https://huggingface.co/{hf_repo_id}/tree/{hf_repo_revision}"
+    api = HfApi()
+    if not api.repo_exists(hf_repo_id):
+        api.create_repo(hf_repo_id, exist_ok=True, private=private)
+    if hf_repo_revision is not None:
+        api.create_branch(repo_id=hf_repo_id, branch=hf_repo_revision, exist_ok=True)
+    api.upload_folder(
+        repo_id=hf_repo_id,
+        revision=hf_repo_revision,
+        folder_path=output_dir,
+        commit_message="upload checkpoint",
+        run_as_future=False,
+    )
+    print(f"🔥 pushed to {hf_repo_url}")
+
 def write_model(
     model_path,
     input_base_path,
@@ -71,6 +76,8 @@ def write_model(
     safe_serialization=True,
     fix_eos_token_id=True,
     tmp_cleanup=True,
+    hf_repo_id=None,
+    hf_repo_revision=None,
 ):
     os.makedirs(model_path, exist_ok=True)
     tmp_model_path = os.path.join(model_path, "tmp")
@@ -208,10 +215,16 @@ def write_model(
     del model.config._name_or_path
     print("Saving in the Transformers format.")
     model.save_pretrained(model_path, safe_serialization=safe_serialization)
+    
+    
     if tmp_cleanup:
         # Make cleanup optional; attempting to `rmtree` the `tmp_model_path` causes
         # errors if using NFS.
         shutil.rmtree(tmp_model_path)
+
+    if hf_repo_id is not None:
+        # let revision be the last folder name
+        push_folder_to_hub(model_path, hf_repo_id=hf_repo_id, hf_repo_revision=hf_repo_revision)
 
 
 def _write_tokenizer(
@@ -282,12 +295,15 @@ def main():
         dest="tmp_cleanup",
         help="If passed, don't remove temp dir at end of HF conversion.",
     )
+    parser.add_argument("--hf_repo_id", type=str, help="Hugging Face repository ID.")
+    parser.add_argument("--hf_repo_revision", type=str, help="Hugging Face repository revision.")
     parser.add_argument(
         "--no_safe_serialization",
         action="store_false",
         dest="safe_serialization",
         help="Whether or not to save using `safetensors`.",
     )
+    # Different OLMo November 2024 versions used different default values for max_position_embeddings, hence the need to be able to specify which version is being used.
     args = parser.parse_args()
     write_model(
         model_path=args.output_dir,
@@ -297,6 +313,8 @@ def main():
         tokenizer_path=args.tokenizer_json_path,
         fix_eos_token_id=args.fix_eos_token_id,
         tmp_cleanup=args.tmp_cleanup,
+        hf_repo_id=args.hf_repo_id,
+        hf_repo_revision=args.hf_repo_revision,
     )
 
 
