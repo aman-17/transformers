@@ -4,11 +4,12 @@
 #             the file from the modular. If any change should be done, please apply the change to the
 #                          modular_olmo2.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
-from typing import Callable, Optional
+from typing import Callable, ClassVar, Optional
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 from transformers.utils.generic import TransformersKwargs
 
@@ -30,6 +31,138 @@ from ...modeling_utils import PreTrainedModel
 from ...utils import auto_docstring, can_return_tuple
 from ...utils.generic import check_model_inputs
 from .configuration_olmo2 import Olmo2Config
+
+
+class FlexAttentionCache:
+    """Cache for compiled flex attention masks to avoid recompilation."""
+
+    # Compiled flex_attention function
+    compiled_flex_attn: ClassVar[Callable] = torch.compile(flex_attention)
+    compiled_create_block_mask: ClassVar[Callable] = torch.compile(create_block_mask)
+
+    # Cache for sink block masks to avoid recompilation
+    sink_block_masks: ClassVar[dict[tuple[int, int, int, int, int], BlockMask]] = {}
+    # Cache for regular causal masks
+    causal_block_masks: ClassVar[dict[tuple[int, int], BlockMask]] = {}
+
+    @classmethod
+    def clear_cache(cls):
+        """Clear all cached masks to free memory."""
+        cls.sink_block_masks.clear()
+        cls.causal_block_masks.clear()
+
+    @staticmethod
+    def _get_causal_mask_mod():
+        """Returns basic causal mask function."""
+
+        def causal_mask(b, h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        return causal_mask
+
+    @staticmethod
+    def _get_causal_with_sink_mask_mod(sink_idx):
+        """Returns causal mask with sink support."""
+
+        def causal_with_sink(b, h, q_idx, kv_idx):
+            return (q_idx >= kv_idx) | (kv_idx == sink_idx)
+
+        return causal_with_sink
+
+    @staticmethod
+    def _get_sliding_window_with_sink_mask_mod(window: int, sink_idx: int):
+        """Returns sliding window mask with sink support."""
+
+        def sliding_with_sink(b, h, q_idx, kv_idx):
+            # causal within window
+            keep = (kv_idx <= q_idx) & (q_idx - kv_idx <= window)
+            # always allow the sink slot
+            return keep | (kv_idx == sink_idx)
+
+        return sliding_with_sink
+
+
+def flex_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    sliding_window: Optional[int] = None,
+    **kwargs,
+):
+    if dropout != 0.0:
+        raise NotImplementedError("Flex attention with dropout not supported yet.")
+
+    B, H, Q, D = query.shape
+    _, _, K, _ = key.shape  # K == seq_len
+
+    # Apply GQA by repeating key/value for compatibility
+    key = repeat_kv(key, module.num_key_value_groups)
+    value = repeat_kv(value, module.num_key_value_groups)
+
+    sink_weights = getattr(module, 'sinks', None)
+    if sink_weights is None:
+        # No sinks - use regular causal mask
+        cache_key = (Q, K)
+        if cache_key not in FlexAttentionCache.causal_block_masks:
+            mask_mod = FlexAttentionCache._get_causal_mask_mod()
+            block_mask = FlexAttentionCache.compiled_create_block_mask(
+                mask_mod, B, H, Q, K
+            )
+            FlexAttentionCache.causal_block_masks[cache_key] = block_mask
+        else:
+            block_mask = FlexAttentionCache.causal_block_masks[cache_key]
+
+        return FlexAttentionCache.compiled_flex_attn(
+            query, key, value, block_mask=block_mask, scale=scaling, enable_gqa=True
+        ).transpose(1, 2).contiguous(), None
+
+    # Handle sinks following the pattern from flex_attn_api.py
+    sink_idx = K  # sink occupies final key slot
+    sink_k = key.new_zeros(B, H, 1, D)  # dummy sink key
+    sink_v = value.new_zeros(B, H, 1, D)  # zero value nullifies sink weight in output
+
+    k_ext = torch.cat([key, sink_k], dim=2)
+    v_ext = torch.cat([value, sink_v], dim=2)
+
+    cache_key = (B, H, Q, K + 1, sliding_window if sliding_window else -1)
+
+    if cache_key not in FlexAttentionCache.sink_block_masks:
+        if sliding_window is not None and sliding_window > 0:
+            mask_mod = FlexAttentionCache._get_sliding_window_with_sink_mask_mod(
+                sliding_window, sink_idx
+            )
+        else:
+            mask_mod = FlexAttentionCache._get_causal_with_sink_mask_mod(sink_idx)
+
+        block_mask = FlexAttentionCache.compiled_create_block_mask(
+            mask_mod, B, H, Q, K + 1
+        )
+        FlexAttentionCache.sink_block_masks[cache_key] = block_mask
+    else:
+        block_mask = FlexAttentionCache.sink_block_masks[cache_key]
+
+    # Overwrite the dummy sink scores with actual sink weights
+    def score_mod(score, b, h_q, q_idx, kv_idx):
+        return torch.where(
+            kv_idx == sink_idx,
+            sink_weights[h_q].to(score.dtype) + 0.0,  # cast + keep grad
+            score,
+        )
+
+    attn_out = FlexAttentionCache.compiled_flex_attn(
+        query, k_ext, v_ext,
+        block_mask=block_mask,
+        score_mod=score_mod,
+        scale=scaling,
+        enable_gqa=True
+    )
+
+    # flex_attention returns (B, H, Q, D), transpose to (B, Q, H, D) format
+    return attn_out.transpose(1, 2).contiguous(), None
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -114,26 +247,21 @@ def eager_attention_forward(
     s_param = module.sinks
     if s_param is not None:
         if s_param.ndim == 1:
+            # Shape [H] means 1 sink token, each head has its own learnable value
             num_sink_tokens = 1
         elif s_param.ndim == 2:
+            # Shape [H, S] means S sink tokens, each head has S learnable values
             num_sink_tokens = s_param.size(1)
         else:
             raise ValueError("module.sinks must have shape [H] or [H, S]")
         # Add dummy sink K/V tensors like in flex attention (zeros are fine since we'll override scores)
         sink_k = key.new_zeros(B, H, num_sink_tokens, D)
         sink_v = value.new_zeros(B, H, num_sink_tokens, D)
-        key = torch.cat([sink_k, key], dim=2)
-        value = torch.cat([sink_v, value], dim=2)
+        key = torch.cat([key, sink_k], dim=2)
+        value = torch.cat([value, sink_v], dim=2)
         local_sinks = s_param  # Use s_param.to_local() if DTensor
-    # Determine if we need to cast (like flex attention)
-    cast_to_bf16 = query.device.type == "cuda"
-    og_dtype = query.dtype
-    # Cast q/k/v early to match flex attention's computation in bf16
-    if cast_to_bf16:
-        query = query.bfloat16()
-        key = key.bfloat16()
-        value = value.bfloat16()
-    # Standard attention computation (now in bf16 if cast)
+
+    # Standard attention computation
     attn_logits = torch.matmul(query, key.transpose(2, 3)) * scaling  # [B, H, Q, K+S]
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, :K]
@@ -142,12 +270,11 @@ def eager_attention_forward(
             sink_mask = torch.zeros(
                 causal_mask.shape[:-1] + (num_sink_tokens,),
                 device=causal_mask.device,
-                dtype=causal_mask.dtype,
+                dtype=attn_logits.dtype,  # Match attn_logits dtype
             )
-            causal_mask = torch.cat([sink_mask, causal_mask], dim=-1)
-        # Cast mask to match attn_logits dtype if needed
-        if cast_to_bf16:
-            causal_mask = causal_mask.bfloat16()
+            causal_mask = torch.cat([sink_mask, causal_mask.to(attn_logits.dtype)], dim=-1)
+        else:
+            causal_mask = causal_mask.to(attn_logits.dtype)
         attn_logits = attn_logits + causal_mask
     # Apply score_mod_fn logic exactly like flex attention (now on bf16 logits if cast)
     if s_param is not None:
@@ -162,16 +289,13 @@ def eager_attention_forward(
                 for s in range(num_sink_tokens):
                     sink_logit = local_sinks[h, s].to(attn_logits.dtype)
                     attn_logits[:, h, :, s] = sink_logit
-    # Use autocast context like flex attention
-    with torch.autocast(enabled=False, device_type=query.device.type):
-        attn_probs = F.softmax(attn_logits, dim=-1, dtype=torch.float32).to(attn_logits.dtype)
-        probs = F.dropout(attn_probs, p=dropout, training=module.training)
-        attn_out = torch.matmul(probs, value)  # [B, H, Q, D]
-    # Cast back to original dtype
-    if cast_to_bf16:
-        attn_out = attn_out.to(og_dtype)
-    # Return only attn_out to match OLMo-core format (no weights)
-    return attn_out.transpose(1, 2).contiguous()
+
+    # Compute attention probabilities and output
+    attn_probs = F.softmax(attn_logits, dim=-1, dtype=torch.float32).to(attn_logits.dtype)
+    probs = F.dropout(attn_probs, p=dropout, training=module.training)
+    attn_out = torch.matmul(probs, value)  # [B, H, Q, D]
+    # Return tuple (attn_out, None) to match attention interface
+    return attn_out.transpose(1, 2).contiguous(), None
 
 
 def rotate_half(x):
@@ -258,7 +382,7 @@ class Olmo2Attention(nn.Module):
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_result = attention_interface(
+        attn_output, attn_weights = attention_interface(
             self,
             query_states,
             key_states,
@@ -268,16 +392,10 @@ class Olmo2Attention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
-        
-        # Handle both single tensor and tuple returns
-        if isinstance(attn_result, tuple):
-            attn_output = attn_result[0]
-        else:
-            attn_output = attn_result
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, None
+        return attn_output, attn_weights
 
 
 class Olmo2MLP(nn.Module):
@@ -577,5 +695,11 @@ class Olmo2ForCausalLM(Olmo2PreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
 
+
+# Register custom flex attention implementation
+try:
+    ALL_ATTENTION_FUNCTIONS["flex_attention"] = flex_attention_forward
+except Exception:
+    pass  # flex attention not available
 
 __all__ = ["Olmo2ForCausalLM", "Olmo2Model", "Olmo2PreTrainedModel"]
